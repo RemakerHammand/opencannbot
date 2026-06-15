@@ -2,7 +2,7 @@
  * CANNBOT Gateway Auth Plugin for OpenCode
  */
 
-import { homedir } from "os";
+import { homedir, networkInterfaces } from "os";
 import { join } from "path";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
 
@@ -130,7 +130,52 @@ async function buildModelsDynamic() {
   return buildModels();
 }
 
+function getMac() {
+  try {
+    for (const name of Object.keys(networkInterfaces())) {
+      for (const iface of networkInterfaces()[name] || []) {
+        if (iface.mac && iface.mac !== "00:00:00:00:00:00" && !iface.internal) return iface.mac;
+      }
+    }
+  } catch {}
+  return "00:00:00:00:00:00";
+}
+
 let cachedVKey = null;
+let cachedJwt = null;
+
+function writeAuthJson(XDG, updates) {
+  try {
+    const authPath = join(XDG, "opencode", "auth.json");
+    let authJson = {};
+    try { authJson = JSON.parse(readFileSync(authPath, "utf-8")); } catch {}
+    Object.assign(authJson, updates);
+    writeFileSync(authPath, JSON.stringify(authJson, null, 2) + "\n");
+  } catch (e) {
+    debugLog("writeAuthJson failed: " + e?.message);
+  }
+}
+
+async function exchangeVkJwt(vk) {
+  try {
+    const mac = getMac();
+    const res = await fetch("https://cannbot.hicann.cn/cannbot/api/auth/authenticate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-vkey": vk },
+      body: JSON.stringify({ type: "cli", mac }),
+    });
+    if (!res.ok) {
+      debugLog("VK→JWT exchange failed: " + res.status);
+      return null;
+    }
+    const json = await res.json();
+    debugLog("VK→JWT exchange OK, expiresIn=" + json.expiresIn);
+    return json;
+  } catch (e) {
+    debugLog("VK→JWT exchange error: " + e?.message);
+    return null;
+  }
+}
 
 export default async function (input) {
   return {
@@ -156,21 +201,73 @@ export default async function (input) {
         },
       ],
       async loader(getAuth) {
+        debugLog("=== auth.loader start ===");
         const info = await getAuth();
+        debugLog(`getAuth(): type=${info?.type}, hasKey=${!!info?.key}, keyPreview=${info?.key?.substring(0, 8) || "none"}`);
+
         let vk = null;
         if (info?.type === "api" && info.key) {
           vk = info.key;
+          debugLog("Scenario A: got VK from getAuth()");
         }
+
+        const XDG = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
+
         if (!vk) {
           try {
-            const XDG = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
             const authJsonPath = join(XDG, "opencode", "auth.json");
             const authJson = JSON.parse(readFileSync(authJsonPath, "utf-8"));
             const entry = authJson["cannbot-vk"] || authJson["cannbot"];
-            if (entry?.type === "api" && entry.key) vk = entry.key;
-          } catch {}
+            if (entry?.type === "api" && entry.key) {
+              vk = entry.key;
+              debugLog("Scenario B: got VK from auth.json");
+            }
+          } catch (e) {
+            debugLog("read auth.json failed: " + e?.message);
+          }
         }
+
         cachedVKey = vk || null;
+
+        if (vk) {
+          // Check if we already have a valid JWT in auth.json
+          let existingJwt = null;
+          try {
+            const authJsonPath = join(XDG, "opencode", "auth.json");
+            const authJson = JSON.parse(readFileSync(authJsonPath, "utf-8"));
+            const cli = authJson["cannbot-cli"];
+            if (cli?.type === "oauth" && cli.access && cli.expires && cli.expires > Math.floor(Date.now() / 1000)) {
+              existingJwt = cli.access;
+              debugLog("Existing valid JWT found in auth.json");
+            }
+          } catch {}
+
+          if (existingJwt) {
+            cachedJwt = existingJwt;
+          } else {
+            debugLog("No valid JWT, exchanging VK...");
+            const result = await exchangeVkJwt(vk);
+            if (result?.accessToken) {
+              cachedJwt = result.accessToken;
+              writeAuthJson(XDG, {
+                "cannbot-cli": {
+                  type: "oauth",
+                  access: result.accessToken,
+                  refresh: vk,
+                  expires: Math.floor(Date.now() / 1000) + (result.expiresIn || 3600),
+                },
+              });
+              debugLog("JWT stored to auth.json as cannbot-cli");
+            } else {
+              cachedJwt = null;
+              debugLog("VK→JWT exchange failed, no Bearer token available");
+            }
+          }
+        }
+
+        debugLog(`cachedVKey: ${cachedVKey ? cachedVKey.substring(0, 8) + "..." : "null"}`);
+        debugLog(`cachedJwt: ${cachedJwt ? cachedJwt.substring(0, 20) + "..." : "null"}`);
+        debugLog("=== auth.loader done ===");
         return {};
       },
     },
@@ -178,21 +275,16 @@ export default async function (input) {
     "chat.headers": async function (input, output) {
       if (input.model.providerID !== PROVIDER_ID) return;
 
-      let vk = cachedVKey;
-      if (!vk) {
-        try {
-          const XDG = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
-          const authPath = join(XDG, "opencode", "auth.json");
-          const authJson = JSON.parse(readFileSync(authPath, "utf-8"));
-          const entry = authJson["cannbot-vk"] || authJson["cannbot"];
-          vk = (entry?.type === "api" && entry.key) ? entry.key : null;
-        } catch {}
+      if (cachedVKey) {
+        output.headers["x-api-vkey"] = cachedVKey;
       }
-      if (vk) output.headers["x-api-vkey"] = vk;
 
       const session = readSession();
-      const bearerToken = session?.accessToken || readAccessTokenFromAuthJson();
-      if (bearerToken) output.headers["Authorization"] = `Bearer ${bearerToken}`;
+      const bearerToken = session?.accessToken || cachedJwt || readAccessTokenFromAuthJson();
+      if (bearerToken) {
+        output.headers["Authorization"] = `Bearer ${bearerToken}`;
+        debugLog("chat.headers: injected Authorization: Bearer");
+      }
     },
   };
 };
