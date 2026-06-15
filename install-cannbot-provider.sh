@@ -86,14 +86,10 @@ const LIMIT = { context: 131072, output: 8192 };
 const COST = { input: 0, output: 0, cache: { read: 0, write: 0 } };
 
 const KNOWN_MODELS = {
-  "qwen-plus": { name: "Qwen Plus", family: "qwen" },
-  "qwen-max": { name: "Qwen Max", family: "qwen" },
-  "qwen-turbo": { name: "Qwen Turbo", family: "qwen" },
-  "qwen-plus-latest": { name: "Qwen Plus Latest", family: "qwen" },
-  "qwen-max-latest": { name: "Qwen Max Latest", family: "qwen" },
-  "qwen-turbo-latest": { name: "Qwen Turbo Latest", family: "qwen" },
-  "deepseek-v3": { name: "DeepSeek V3", family: "deepseek" },
-  "deepseek-r1": { name: "DeepSeek R1", family: "deepseek" },
+  "glm-5": { name: "GLM 5", family: "glm" },
+  "glm-5.1": { name: "GLM 5.1", family: "glm" },
+  "qwen3.6-plus": { name: "Qwen 3.6 Plus", family: "qwen" },
+  "qwen3.7-max": { name: "Qwen 3.7 Max", family: "qwen" },
 };
 
 function buildModels() {
