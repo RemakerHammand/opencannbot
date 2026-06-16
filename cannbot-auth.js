@@ -6,36 +6,87 @@ import { homedir, networkInterfaces } from "os";
 import { join } from "path";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
 
-const PLUGIN_ID = "cannbot-gateway-auth";
 const PROVIDER_ID = "cannbot";
 const GATEWAY_URL = "https://cannbot.hicann.cn/gateway/compatible-mode/v1";
-const SESSION_PATH = join(homedir(), ".cannbot", "session.json");
 const MODELS_API_URL = "https://cannbot.hicann.cn/cannbot/api/models/list";
+const AUTHENTICATE_URL = "https://cannbot.hicann.cn/cannbot/api/auth/authenticate";
+const CANNBOT_DIR = join(homedir(), ".cannbot");
+const JWT_CACHE_PATH = join(CANNBOT_DIR, "jwt.json");
+const MODELS_CACHE_PATH = join(CANNBOT_DIR, "models-cache.json");
+const MODELS_CACHE_TTL_MS = 24 * 3600 * 1000; // refresh in background once a day
+const MODELS_FETCH_TIMEOUT_MS = 1500; // never block startup on a slow network
 
-const DEBUG_LOG_PATH = join(homedir(), ".local", "share", "opencode", "log", "cannbot-auth-plugin.log");
+// opencode's data dir; respects XDG_DATA_HOME on every platform (incl. Windows).
+const DATA_DIR = join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "opencode");
+const AUTH_JSON_PATH = join(DATA_DIR, "auth.json");
+const LOG_DIR = join(DATA_DIR, "log");
+const DEBUG_LOG_PATH = join(LOG_DIR, "cannbot-auth-plugin.log");
 
+let logDirReady = false;
 function debugLog(msg) {
   try {
-    const dir = join(homedir(), ".local", "share", "opencode", "log");
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    const ts = new Date().toISOString();
-    writeFileSync(DEBUG_LOG_PATH, `[${ts}] ${msg}\n`, { flag: "a" });
+    if (!logDirReady) {
+      if (!existsSync(LOG_DIR)) mkdirSync(LOG_DIR, { recursive: true });
+      logDirReady = true;
+    }
+    writeFileSync(DEBUG_LOG_PATH, `[${new Date().toISOString()}] ${msg}\n`, { flag: "a" });
   } catch {}
 }
 
-function readSession() {
-  try {
-    return JSON.parse(readFileSync(SESSION_PATH, "utf-8"));
-  } catch {
-    return null;
+const MAX_DURATION_SECONDS = 30 * 24 * 3600; // 30 days — beyond this, assume milliseconds
+const MAX_REASONABLE_DURATION_S = 365 * 24 * 3600; // 1 year — cap for sanity
+const CURRENT_EPOCH_SECONDS = () => Math.floor(Date.now() / 1000);
+
+function toUnixExpires(expiresIn) {
+  const now = CURRENT_EPOCH_SECONDS();
+  if (typeof expiresIn !== "number" || !Number.isFinite(expiresIn)) return now + 3600;
+
+  let durationSeconds;
+  if (expiresIn > 1e12) {
+    durationSeconds = Math.floor(expiresIn / 1000) - now; // ms epoch → s relative
+  } else if (expiresIn > MAX_DURATION_SECONDS) {
+    durationSeconds = Math.floor(expiresIn / 1000); // duration in ms, not seconds
+  } else {
+    durationSeconds = expiresIn;
   }
+
+  if (durationSeconds <= 0 || durationSeconds > MAX_REASONABLE_DURATION_S) return now + 3600;
+  return now + durationSeconds;
+}
+
+// JWT cache lives in ~/.cannbot/ (our own dir) so opencode rewriting auth.json
+// can never clobber it and force a needless re-exchange. Shape: { access, expires, refresh }.
+function readJwtCache() {
+  try {
+    const j = JSON.parse(readFileSync(JWT_CACHE_PATH, "utf-8"));
+    if (j?.access) return j;
+  } catch {}
+  return null;
+}
+
+function ensureCannbotDir() {
+  if (!existsSync(CANNBOT_DIR)) mkdirSync(CANNBOT_DIR, { recursive: true });
+}
+
+function writeJwtCache(obj) {
+  try {
+    ensureCannbotDir();
+    writeFileSync(JWT_CACHE_PATH, JSON.stringify(obj, null, 2));
+  } catch (e) {
+    debugLog("writeJwtCache failed: " + e?.message);
+  }
+}
+
+// A JWT is usable if it exists and won't expire within the next minute.
+function jwtIsValid(entry) {
+  if (!entry?.access || typeof entry.expires !== "number") return false;
+  const now = CURRENT_EPOCH_SECONDS();
+  return entry.expires > now + 60 && entry.expires < now + MAX_REASONABLE_DURATION_S;
 }
 
 function readAccessTokenFromAuthJson() {
   try {
-    const XDG = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
-    const authJsonPath = join(XDG, "opencode", "auth.json");
-    const authJson = JSON.parse(readFileSync(authJsonPath, "utf-8"));
+    const authJson = JSON.parse(readFileSync(AUTH_JSON_PATH, "utf-8"));
     const entry = authJson["cannbot-cli"];
     if (entry?.type === "oauth" && entry.access) {
       return entry.access;
@@ -86,12 +137,14 @@ function buildModels() {
 }
 
 async function fetchModelsFromAPI() {
-  const session = readSession();
-  const token = session?.accessToken || readAccessTokenFromAuthJson();
+  const token = cachedJwt || readJwtCache()?.access || readAccessTokenFromAuthJson();
   if (!token) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), MODELS_FETCH_TIMEOUT_MS);
   try {
     const res = await fetch(`${MODELS_API_URL}?page=1&size=100`, {
       headers: { Authorization: `Bearer ${token}` },
+      signal: controller.signal,
     });
     if (!res.ok) return null;
     const json = await res.json();
@@ -99,41 +152,78 @@ async function fetchModelsFromAPI() {
     return active.length > 0 ? active : null;
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-async function buildModelsDynamic() {
-  const apiModels = await fetchModelsFromAPI();
-  if (apiModels && apiModels.length > 0) {
-    return Object.fromEntries(
-      apiModels.map((m) => {
-        const id = m.model;
-        return [
+function modelsFromApiList(apiModels) {
+  return Object.fromEntries(
+    apiModels.map((m) => {
+      const id = m.model;
+      return [
+        id,
+        {
           id,
-          {
-            id,
-            name: m.title,
-            family: "cannbot",
-            api: { id, url: GATEWAY_URL, npm: "@ai-sdk/openai-compatible" },
-            capabilities: { ...CAPABILITIES },
-            limit: { context: m.contextLength, output: m.maxTokens },
-            cost: { input: COST.input, output: COST.output, cache: { ...COST.cache } },
-            status: "active",
-            options: {},
-            headers: {},
-            release_date: "",
-          },
-        ];
-      }),
-    );
+          name: m.title,
+          family: "cannbot",
+          api: { id, url: GATEWAY_URL, npm: "@ai-sdk/openai-compatible" },
+          capabilities: { ...CAPABILITIES },
+          limit: { context: m.contextLength, output: m.maxTokens },
+          cost: { input: COST.input, output: COST.output, cache: { ...COST.cache } },
+          status: "active",
+          options: {},
+          headers: {},
+          release_date: "",
+        },
+      ];
+    }),
+  );
+}
+
+function readModelsCache() {
+  try {
+    const cache = JSON.parse(readFileSync(MODELS_CACHE_PATH, "utf-8"));
+    if (cache && cache.models && Object.keys(cache.models).length > 0) return cache;
+  } catch {}
+  return null;
+}
+
+function writeModelsCache(models) {
+  try {
+    ensureCannbotDir();
+    writeFileSync(MODELS_CACHE_PATH, JSON.stringify({ ts: Date.now(), models }, null, 2));
+  } catch (e) {
+    debugLog("writeModelsCache failed: " + e?.message);
   }
+}
+
+// Synchronous, never blocks startup: prefer disk cache, fall back to the static list.
+function loadModelsFast() {
+  const cache = readModelsCache();
+  if (cache) return cache.models;
   return buildModels();
+}
+
+// Fire-and-forget: refresh the on-disk cache so the next startup sees fresh models.
+async function refreshModelsCache() {
+  try {
+    const cache = readModelsCache();
+    if (cache && Date.now() - (cache.ts || 0) < MODELS_CACHE_TTL_MS) return; // still fresh
+    const apiModels = await fetchModelsFromAPI();
+    if (apiModels && apiModels.length > 0) {
+      writeModelsCache(modelsFromApiList(apiModels));
+      debugLog("models cache refreshed (" + apiModels.length + " models)");
+    }
+  } catch (e) {
+    debugLog("refreshModelsCache failed: " + e?.message);
+  }
 }
 
 function getMac() {
   try {
-    for (const name of Object.keys(networkInterfaces())) {
-      for (const iface of networkInterfaces()[name] || []) {
+    for (const ifaces of Object.values(networkInterfaces())) {
+      for (const iface of ifaces || []) {
         if (iface.mac && iface.mac !== "00:00:00:00:00:00" && !iface.internal) return iface.mac;
       }
     }
@@ -144,40 +234,28 @@ function getMac() {
 let cachedVKey = null;
 let cachedJwt = null;
 
-function writeAuthJson(XDG, updates) {
-  try {
-    const authPath = join(XDG, "opencode", "auth.json");
-    let authJson = {};
-    try { authJson = JSON.parse(readFileSync(authPath, "utf-8")); } catch {}
-    Object.assign(authJson, updates);
-    writeFileSync(authPath, JSON.stringify(authJson, null, 2) + "\n");
-  } catch (e) {
-    debugLog("writeAuthJson failed: " + e?.message);
-  }
-}
-
 async function exchangeVkJwt(vk) {
   try {
     const mac = getMac();
-    const res = await fetch("https://cannbot.hicann.cn/cannbot/api/auth/authenticate", {
+    const res = await fetch(AUTHENTICATE_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-vkey": vk },
       body: JSON.stringify({ type: "cli", mac }),
     });
     if (!res.ok) {
-      debugLog("VK→JWT exchange failed: " + res.status);
+      debugLog("VK->JWT exchange failed: " + res.status);
       return null;
     }
     const json = await res.json();
-    debugLog("VK→JWT exchange OK, expiresIn=" + json.expiresIn);
+    debugLog("VK->JWT exchange OK, expiresIn=" + json.expiresIn);
     return json;
   } catch (e) {
-    debugLog("VK→JWT exchange error: " + e?.message);
+    debugLog("VK->JWT exchange error: " + e?.message);
     return null;
   }
 }
 
-export default async function (input) {
+export default async function () {
   return {
     config: async function (cfg) {
       cfg.provider = cfg.provider ?? {};
@@ -185,8 +263,10 @@ export default async function (input) {
         name: "CANNBOT",
         npm: "@ai-sdk/openai-compatible",
         options: { baseURL: GATEWAY_URL },
-        models: await buildModelsDynamic(),
+        models: loadModelsFast(), // synchronous: cache or static list, no network
       };
+      // Refresh the cache in the background; next startup picks up any changes.
+      refreshModelsCache();
     },
 
     auth: {
@@ -211,12 +291,9 @@ export default async function (input) {
           debugLog("Scenario A: got VK from getAuth()");
         }
 
-        const XDG = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
-
         if (!vk) {
           try {
-            const authJsonPath = join(XDG, "opencode", "auth.json");
-            const authJson = JSON.parse(readFileSync(authJsonPath, "utf-8"));
+            const authJson = JSON.parse(readFileSync(AUTH_JSON_PATH, "utf-8"));
             const entry = authJson["cannbot-vk"] || authJson["cannbot"];
             if (entry?.type === "api" && entry.key) {
               vk = entry.key;
@@ -230,37 +307,38 @@ export default async function (input) {
         cachedVKey = vk || null;
 
         if (vk) {
-          // Check if we already have a valid JWT in auth.json
-          let existingJwt = null;
-          try {
-            const authJsonPath = join(XDG, "opencode", "auth.json");
-            const authJson = JSON.parse(readFileSync(authJsonPath, "utf-8"));
-            const cli = authJson["cannbot-cli"];
-            if (cli?.type === "oauth" && cli.access && cli.expires && cli.expires > Math.floor(Date.now() / 1000)) {
-              existingJwt = cli.access;
-              debugLog("Existing valid JWT found in auth.json");
-            }
-          } catch {}
+          // Source of truth: ~/.cannbot/jwt.json. Fall back to a one-time migration
+          // from auth.json for users upgrading from the old behaviour.
+          let entry = readJwtCache();
+          if (!jwtIsValid(entry)) {
+            try {
+              const authJson = JSON.parse(readFileSync(AUTH_JSON_PATH, "utf-8"));
+              const cli = authJson["cannbot-cli"];
+              if (cli?.type === "oauth" && jwtIsValid({ access: cli.access, expires: cli.expires })) {
+                entry = { access: cli.access, expires: cli.expires, refresh: vk };
+                writeJwtCache(entry);
+                debugLog("Migrated JWT from auth.json into jwt cache");
+              }
+            } catch {}
+          }
 
-          if (existingJwt) {
-            cachedJwt = existingJwt;
+          if (jwtIsValid(entry)) {
+            cachedJwt = entry.access;
+            debugLog("Valid JWT from cache (expires_in=" + (entry.expires - CURRENT_EPOCH_SECONDS()) + "s)");
           } else {
             debugLog("No valid JWT, exchanging VK...");
             const result = await exchangeVkJwt(vk);
             if (result?.accessToken) {
               cachedJwt = result.accessToken;
-              writeAuthJson(XDG, {
-                "cannbot-cli": {
-                  type: "oauth",
-                  access: result.accessToken,
-                  refresh: vk,
-                  expires: Math.floor(Date.now() / 1000) + (result.expiresIn || 3600),
-                },
+              writeJwtCache({
+                access: result.accessToken,
+                refresh: vk,
+                expires: toUnixExpires(result.expiresIn),
               });
-              debugLog("JWT stored to auth.json as cannbot-cli");
+              debugLog("JWT stored to jwt cache");
             } else {
               cachedJwt = null;
-              debugLog("VK→JWT exchange failed, no Bearer token available");
+              debugLog("VK->JWT exchange failed, no Bearer token available");
             }
           }
         }
@@ -279,8 +357,9 @@ export default async function (input) {
         output.headers["x-api-vkey"] = cachedVKey;
       }
 
-      const session = readSession();
-      const bearerToken = session?.accessToken || cachedJwt || readAccessTokenFromAuthJson();
+      // Prefer the in-memory JWT resolved by the loader; only touch disk if it's
+      // somehow absent (e.g. chat.headers fired before loader on a cold path).
+      const bearerToken = cachedJwt || readJwtCache()?.access || readAccessTokenFromAuthJson();
       if (bearerToken) {
         output.headers["Authorization"] = `Bearer ${bearerToken}`;
         debugLog("chat.headers: injected Authorization: Bearer");
