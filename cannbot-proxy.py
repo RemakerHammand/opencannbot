@@ -100,9 +100,126 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_KEEPALIVE_IDLE = 300
 DEFAULT_SOCKET_TIMEOUT = 30
+DEFAULT_USAGE_DIR = os.path.expanduser("~/.cannbot/proxy")
+DEFAULT_HOSTNAME = socket.gethostname()
 
 # ── Logging ─────────────────────────────────────────────────────────────
 log = logging.getLogger("cannbot-proxy")
+
+
+# ── Usage tracking (process-wide, thread-safe) ──────────────────────────
+_usage_lock = threading.Lock()
+_usage_file: str = ""
+_usage_hostname: str = ""
+
+
+def _init_usage(path: str, hostname: str) -> None:
+    global _usage_file, _usage_hostname
+    _usage_file = os.path.join(path, "usage.jsonl")
+    _usage_hostname = hostname
+    os.makedirs(path, exist_ok=True)
+
+
+def _record_usage(model: str, usage: dict) -> None:
+    """Append one usage event to the JSONL log and update the in-memory cache."""
+    if not usage or not _usage_file:
+        return
+    event = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+        "host": _usage_hostname,
+        "model": model or "unknown",
+        "prompt_tokens": usage.get("prompt_tokens", 0),
+        "completion_tokens": usage.get("completion_tokens", 0),
+        "total_tokens": usage.get("total_tokens", 0),
+        "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0),
+        "cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
+    }
+    with _usage_lock:
+        try:
+            with open(_usage_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except OSError as e:
+            log.warning("Failed to write usage log: %s", e)
+
+
+def _parse_usage_from_sse(buffer: bytes) -> Optional[dict]:
+    """Extract the last ``usage`` object from accumulated SSE chunks."""
+    try:
+        text = buffer.decode("utf-8", "replace")
+    except Exception:
+        return None
+    last_usage = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]" or not payload:
+            continue
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        u = obj.get("usage")
+        if isinstance(u, dict):
+            last_usage = u
+        if u and obj.get("usage"):  # snapshot cumulative
+            last_usage = obj["usage"]
+    return last_usage
+
+
+def _read_usage_summary(limit: int = 0) -> dict:
+    """Read usage.jsonl and return a summary. If *limit* > 0, also include recent N entries."""
+    if not _usage_file or not os.path.isfile(_usage_file):
+        return {"total_requests": 0, "by_model": {}, "by_day": {}, "recent": []}
+    by_model: dict = {}
+    by_day: dict = {}
+    total_requests = 0
+    total_prompt = 0
+    total_completion = 0
+    total_tokens = 0
+    recent: list = []
+    with _usage_lock:
+        with open(_usage_file, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        total_requests += 1
+        pt = e.get("prompt_tokens", 0)
+        ct = e.get("completion_tokens", 0)
+        tt = e.get("total_tokens", 0)
+        total_prompt += pt
+        total_completion += ct
+        total_tokens += tt
+        m = e.get("model", "unknown")
+        bm = by_model.setdefault(m, {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+        bm["requests"] += 1
+        bm["prompt_tokens"] += pt
+        bm["completion_tokens"] += ct
+        bm["total_tokens"] += tt
+        day = e.get("ts", "")[:10]
+        bd = by_day.setdefault(day, {"requests": 0, "total_tokens": 0})
+        bd["requests"] += 1
+        bd["total_tokens"] += tt
+    if limit > 0:
+        recent = [json.loads(l) for l in lines[-limit:] if l.strip()]
+    return {
+        "host": _usage_hostname,
+        "usage_file": _usage_file,
+        "total_requests": total_requests,
+        "total_prompt_tokens": total_prompt,
+        "total_completion_tokens": total_completion,
+        "total_tokens": total_tokens,
+        "by_model": by_model,
+        "by_day": by_day,
+        "recent": recent,
+    }
 
 
 def _setup_logging(level: str) -> None:
@@ -248,13 +365,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
             parsed.hostname, parsed.port or 80, timeout=timeout
         )
 
-    def _read_with_keepalive(self, conn, resp):
+    def _read_with_keepalive(self, conn, resp, capture_buf=None):
         """Stream response body with keepalive mechanism.
 
         - Each successful read resets the idle timer.
         - A single socket timeout does NOT abort; we check the keepalive
           window and retry.
         - Only abort if no data for ``keepalive_idle`` seconds total.
+        - If *capture_buf* is a bytearray, accumulate the full body into it
+          (used for usage extraction).
         """
         keepalive_idle = self.server.keepalive_idle
         socket_timeout = self.server.socket_timeout
@@ -288,6 +407,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 break
 
             last_data_time = time.time()
+            if capture_buf is not None:
+                capture_buf.extend(chunk)
             try:
                 self.wfile.write(chunk)
                 self.wfile.flush()
@@ -302,9 +423,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._handle_health()
             return
 
+        # 1b. Usage summary
+        if self.path == "/_usage" or self.path.startswith("/_usage?"):
+            self._handle_usage()
+            return
+
         # 2. Read request body
         content_length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(content_length) if content_length > 0 else None
+
+        # Parse model from request body for usage attribution
+        req_model = "unknown"
+        if body:
+            try:
+                req_model = json.loads(body).get("model", "unknown")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass
 
         # 3. Extract auth key from Authorization header
         auth_header = self.headers.get("Authorization", "")
@@ -380,15 +514,33 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.send_header("Connection", "close")
                 self.end_headers()
 
-                # Stream response body with keepalive
+                # Stream response body with keepalive; capture body for usage
+                capture = bytearray()
+                is_usage_path = "/chat/completions" in self.path or "/completions" in self.path
                 try:
-                    self._read_with_keepalive(conn, resp)
+                    self._read_with_keepalive(
+                        conn, resp,
+                        capture_buf=capture if is_usage_path else None,
+                    )
                 except BrokenPipeError:
                     log.warning("Client disconnected mid-stream")
                     return
                 except TimeoutError as e:
                     log.error("%s", e)
                     return
+
+                # Extract usage from captured response body
+                if is_usage_path and capture:
+                    try:
+                        ctype = (resp.getheader("Content-Type") or "").lower()
+                        if "text/event-stream" in ctype:
+                            usage = _parse_usage_from_sse(bytes(capture))
+                        else:
+                            usage = json.loads(capture).get("usage")
+                        if usage:
+                            _record_usage(req_model, usage)
+                    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
+                        log.debug("Could not parse usage from response: %s", e)
 
                 last_exc = None
                 break
@@ -446,7 +598,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "gateway": GATEWAY_URL,
             "keepalive_idle": self.server.keepalive_idle,
             "socket_timeout": self.server.socket_timeout,
+            "usage_file": _usage_file,
         })
+
+    def _handle_usage(self) -> None:
+        # Parse query: /_usage?recent=10  → include last 10 entries
+        limit = 0
+        if "?" in self.path:
+            from urllib.parse import parse_qs
+            qs = parse_qs(self.path.split("?", 1)[1])
+            r = qs.get("recent", [None])[0]
+            if r and r.isdigit():
+                limit = int(r)
+        summary = _read_usage_summary(limit=limit)
+        self._send_json(200, summary)
 
 
 class _Server(ThreadingHTTPServer):
@@ -530,6 +695,12 @@ def main() -> None:
     args = _parse_args()
     vk, host, port, log_level, keepalive_idle, socket_timeout = _resolve_config(args)
     _setup_logging(log_level)
+
+    # Initialize usage tracking
+    usage_dir = os.environ.get("CANNBOT_USAGE_DIR", DEFAULT_USAGE_DIR)
+    usage_host = os.environ.get("CANNBOT_USAGE_HOST", DEFAULT_HOSTNAME)
+    _init_usage(usage_dir, usage_host)
+    log.info("  Usage log    : %s/usage.jsonl (host=%s)", usage_dir, usage_host)
 
     if args.log:
         try:

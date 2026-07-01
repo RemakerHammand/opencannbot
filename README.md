@@ -255,13 +255,110 @@ npm run package   # 打包 .vsix
 
 ---
 
+## Token 用量统计（多服务器）
+
+代理会在每次 `/chat/completions` 请求完成后，从响应中提取 `usage` 字段并记录到本地 `~/.cannbot/proxy/usage.jsonl`。支持非流式和流式（SSE）两种响应格式。
+
+### 单机查询
+
+代理自带 `/_usage` 端点，返回本机累计汇总：
+
+```bash
+# 汇总（按模型、按天）
+curl -sS http://127.0.0.1:8765/_usage
+
+# 包含最近 10 条明细
+curl -sS "http://127.0.0.1:8765/_usage?recent=10"
+```
+
+返回示例：
+
+```json
+{
+  "host": "server-1",
+  "usage_file": "~/.cannbot/proxy/usage.jsonl",
+  "total_requests": 42,
+  "total_prompt_tokens": 12000,
+  "total_completion_tokens": 8000,
+  "total_tokens": 20000,
+  "by_model": { "glm-5.2": { "requests": 42, "total_tokens": 20000 } },
+  "by_day":   { "2026-07-01": { "requests": 42, "total_tokens": 20000 } }
+}
+```
+
+### 多机聚合
+
+`cannbot-usage-aggregate.py` 通过 SSH 批量拉取各机器的用量并合并：
+
+```bash
+# 方式 A：SSH + 代理 /_usage API（要求代理在各机器上运行中）
+python3 cannbot-usage-aggregate.py \
+    alice@server1:8765 \
+    bob@server2:8765 \
+    server3:8765
+
+# 方式 B：SSH + 直接 cat jsonl（代理未运行时用）
+python3 cannbot-usage-aggregate.py --cat \
+    alice@server1 \
+    bob@server2
+
+# 方式 C：先把 jsonl 拉到本地，再合并
+scp server1:~/.cannbot/proxy/usage.jsonl /tmp/s1.jsonl
+scp server2:~/.cannbot/proxy/usage.jsonl /tmp/s2.jsonl
+python3 cannbot-usage-aggregate.py --local /tmp/s1.jsonl /tmp/s2.jsonl
+
+# 从 hosts 文件读取（每行 user@host:port，# 开头为注释）
+python3 cannbot-usage-aggregate.py --hosts-file hosts.txt
+
+# JSON 输出（接入监控 / Grafana）
+python3 cannbot-usage-aggregate.py --hosts-file hosts.txt --json
+```
+
+输出表格示例：
+
+```
+======================================================================
+  CANNBOT Usage Summary  (4 records)
+======================================================================
+
+  Total requests        : 4
+  Total tokens          : 557
+
+----------------------------------------------------------------------
+  By Host
+----------------------------------------------------------------------
+  Host                   Requests       Total
+  server-1                      2          127
+  server-2                      2          430
+
+----------------------------------------------------------------------
+  By Host x Model
+----------------------------------------------------------------------
+  Host               Model                    Requests        Total
+  server-1           glm-5.2                         2          127
+  server-2           glm-5.2                         1          300
+  server-2           qwen-max                        1          130
+```
+
+### 配置
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `CANNBOT_USAGE_DIR` | `~/.cannbot/proxy` | `usage.jsonl` 写入目录 |
+| `CANNBOT_USAGE_HOST` | `$(hostname)` | 记录中的 `host` 字段（多机区分用）；建议设为可识别名称 |
+
+> **提示**：多机部署时建议每台机器都设 `CANNBOT_USAGE_HOST` 为唯一标识（如 `prod-web-01`），聚合时更清晰。
+
+---
+
 ## 仓库结构
 
 | 文件 | 作用 |
 |------|------|
 | `cannbot-auth.js` | OpenCode 用的 provider 插件 |
 | `install-cannbot-provider.sh` / `.ps1` | 一键把插件装进 opencode |
-| `cannbot-proxy.py` | Trae IDE 用的本地运行组件 |
+| `cannbot-proxy.py` | Trae IDE 用的本地运行组件；内置用量记录 |
+| `cannbot-usage-aggregate.py` | 多服务器 token 用量聚合脚本（SSH 批量拉取） |
 | `install-cannbot-trae.sh` / `.ps1` | 一键安装 Trae 组件（macOS / Linux / Windows） |
 | `uninstall-cannbot-trae.sh` | 卸载 Trae 组件 |
 | `cannbot-claude-proxy.py` | Claude Code 用的本地运行组件 |
